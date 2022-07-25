@@ -1,6 +1,8 @@
 ﻿using BepInEx;
 using BepInEx.Configuration;
+using BepInEx.Logging;
 using HarmonyLib;
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
@@ -10,7 +12,7 @@ using UnityEngine;
 namespace AutoFeed
 {
     [BepInPlugin("aedenthorn.AutoFeed", "Auto Feed", "0.6.2")]
-    public class BepInExPlugin: BaseUnityPlugin
+    public class BepInExPlugin : BaseUnityPlugin
     {
         public static ConfigEntry<bool> isDebug;
 
@@ -18,17 +20,22 @@ namespace AutoFeed
         public static ConfigEntry<float> moveProximity;
         public static ConfigEntry<string> feedDisallowTypes;
         public static ConfigEntry<string> animalDisallowTypes;
+        public static ConfigEntry<string> containerAllowTypes;
+        public static ConfigEntry<bool> logContainerNames;
         public static ConfigEntry<string> toggleKey;
         public static ConfigEntry<string> toggleString;
         public static ConfigEntry<bool> isOn;
         public static ConfigEntry<bool> requireMove;
         public static ConfigEntry<bool> requireOnlyFood;
+        public static ConfigEntry<bool> requireBreedingConditions;
         public static ConfigEntry<bool> modEnabled;
         public static ConfigEntry<int> nexusID;
 
         private static BepInExPlugin context;
         private static float lastFeed;
         private static int feedCount;
+
+        public static ManualLogSource MyLogger = BepInEx.Logging.Logger.CreateLogSource(Assembly.GetExecutingAssembly().GetName().Name);
 
 
         public static void Dbgl(string str = "", bool pref = true)
@@ -42,22 +49,26 @@ namespace AutoFeed
             containerRange = Config.Bind<float>("Config", "ContainerRange", 10f, "Container range in metres.");
             feedDisallowTypes = Config.Bind<string>("Config", "FeedDisallowTypes", "", "Types of item to disallow as feed, comma-separated.");
             animalDisallowTypes = Config.Bind<string>("Config", "AnimalDisallowTypes", "", "Types of creature to disallow to feed, comma-separated.");
-            requireMove = Config.Bind<bool>("Config", "RequireMove", true, "Require animals to move to container to feed.");
-            requireOnlyFood = Config.Bind<bool>("Config", "RequireOnlyFood", false, "Don't allow feeding from containers that have items that the animal will not eat as well.");
+            containerAllowTypes = Config.Bind<string>("Config", "ContainerAllowTypes", "", "Types of container to allow as feeders, comma-separated. Leave blank to allow all compatible contianers. To use only the Balrond Trough from https://www.nexusmods.com/valheim/mods/1877 (or https://valheim.thunderstore.io/package/CookieMilk/Food_Trough/) use 'piece_chest_trough'. Names listed here are prefixes, so 'piece_chest' will allow 'piece_chest_wood' and 'piece_chest_trough', etc. If a modded container has a name that is incompatible with this mod, 'piece_chest,Container,magic_trunk' will allow all vanilla containers, any other containers starting with piece_chest or Container, and a modded container named magic_trunk.");
+            logContainerNames = Config.Bind<bool>("Config", "LogContainerNames", false, "Log container names near your creature to the BepInEx LogOutput.log. Useful for finding container names to allow. Should normally be false as it will spam the log.");
+            requireMove = Config.Bind<bool>("Config", "RequireMove", true, "Require creatures to move to container to feed.");
+            requireOnlyFood = Config.Bind<bool>("Config", "RequireOnlyFood", false, "Don't allow feeding from containers that have items that the creature will not eat as well.");
+            requireBreedingConditions = Config.Bind<bool>("Config", "Require Breeding Conditions", false, "Require creatures to only eat if conditions are right for breeding. NOTE: This doesn't guarantee they will breed once they eat, just that there was at least one potential partner near the container and the limit on that type of creature hadn't been reached near the container at the time the creature decided to eat there.");
             moveProximity = Config.Bind<float>("Config", "MoveProximity", 2f, "How close to move towards the container if RequireMove is true.");
-            
+
             toggleKey = Config.Bind<string>("General", "ToggleKey", "", "Key to toggle behaviour. Leave blank to disable the toggle key. Use https://docs.unity3d.com/Manual/ConventionalGameInput.html");
             toggleString = Config.Bind<string>("General", "ToggleString", "Auto Feed: {0}", "Text to show on toggle. {0} is replaced with true/false");
             modEnabled = Config.Bind<bool>("General", "Enabled", true, "Enable this mod");
             isDebug = Config.Bind<bool>("General", "IsDebug", true, "Show debug logs");
             nexusID = Config.Bind<int>("General", "NexusID", 985, "Nexus mod ID for updates");
-            
+
             isOn = Config.Bind<bool>("ZAuto", "IsOn", true, "Behaviour is currently on or not");
 
             if (!modEnabled.Value)
                 return;
 
             Harmony.CreateAndPatchAll(Assembly.GetExecutingAssembly(), null);
+
         }
 
         private void Update()
@@ -72,7 +83,7 @@ namespace AutoFeed
         }
         private static string GetPrefabName(string name)
         {
-            char[] anyOf = new char[]{'(',' '};
+            char[] anyOf = new char[] { '(', ' ' };
             int num = name.IndexOfAny(anyOf);
             string result;
             if (num >= 0)
@@ -84,26 +95,45 @@ namespace AutoFeed
 
         public static List<Container> GetNearbyContainers(Vector3 center, float range, MonsterAI monsterAI)
         {
-            try { 
+            try
+            {
                 List<Container> containers = new List<Container>();
+                String[] allowedContainerTypes;
+                if (!containerAllowTypes.Value.IsNullOrWhiteSpace())
+                {
+                    allowedContainerTypes = containerAllowTypes.Value.Split(',');
+                }
+                else
+                {
+                    allowedContainerTypes = new String[] { "piece_chest", "Container" };
+                }
 
                 foreach (Collider collider in Physics.OverlapSphere(center, Mathf.Max(range, 0), LayerMask.GetMask(new string[] { "piece" })))
                 {
                     Container container = collider.transform.parent?.parent?.gameObject?.GetComponent<Container>();
                     if (container?.GetComponent<ZNetView>()?.IsValid() != true)
                         continue;
-                    if ((container.name.StartsWith("piece_chest") || container.name.StartsWith("Container")) && container.GetInventory() != null)
+                    if (logContainerNames.Value == true)
+                        MyLogger.LogInfo("Nearby Container: " + container.name);
+                    if (container.GetInventory() == null)
+                        continue;
+                    bool isContainerAllowed = false;
+                    foreach (String allowedContainer in allowedContainerTypes)
                     {
-                        if (requireOnlyFood.Value)
-                        {
-                            foreach(ItemDrop.ItemData item in container.GetInventory().GetAllItems())
-                            {
-                                if(!monsterAI.m_consumeItems.Exists(i => i.m_itemData.m_shared.m_name == item.m_shared.m_name))
-                                    continue;
-                            }
-                        }
-                        containers.Add(container);
+                        if (container.name.StartsWith(allowedContainer))
+                            isContainerAllowed = true;
                     }
+                    if (!isContainerAllowed)
+                        continue;
+                    if (requireOnlyFood.Value)
+                    {
+                        foreach (ItemDrop.ItemData item in container.GetInventory().GetAllItems())
+                        {
+                            if (!monsterAI.m_consumeItems.Exists(i => i.m_itemData.m_shared.m_name == item.m_shared.m_name))
+                                continue;
+                        }
+                    }
+                    containers.Add(container);
                 }
                 containers.OrderBy(c => Vector3.Distance(c.transform.position, center));
                 return containers;
@@ -112,6 +142,61 @@ namespace AutoFeed
             {
                 return new List<Container>();
             }
+        }
+
+        public static bool canBreedNearContainer(Character character, ZNetView nview, Container container)
+        {
+            Procreation procreation = nview.GetComponent<Procreation>();
+            GameObject myPrefab;
+            GameObject offspringPrefab;
+            myPrefab = ZNetScene.instance.GetPrefab(nview.GetZDO().GetPrefab());
+            offspringPrefab = ZNetScene.instance.GetPrefab(Utils.GetPrefabName(procreation.m_offspring));
+
+            GameObject baseComponent;
+
+            if (requireMove.Value)
+            {
+                baseComponent = container.gameObject;
+            }
+            else
+            {
+                baseComponent = character.gameObject;
+            }
+            
+
+            int nrOfInstances = SpawnSystem.GetNrOfInstances(myPrefab, baseComponent.transform.position, procreation.m_totalCheckRange);
+            int nrOfInstances2 = SpawnSystem.GetNrOfInstances(offspringPrefab, baseComponent.transform.position, procreation.m_totalCheckRange);
+            int nrOfParterInstances = 0;
+
+            string text = myPrefab.name + "(Clone)";
+            if (myPrefab.GetComponent<BaseAI>() != null)
+            {
+                List<BaseAI> allInstances = BaseAI.GetAllInstances();
+                {
+                    foreach (BaseAI potentialMate in allInstances)
+                    {
+                        if (potentialMate.gameObject.name != text || (procreation.m_partnerCheckRange > 0f && Vector3.Distance(baseComponent.transform.position, potentialMate.transform.position) > procreation.m_totalCheckRange))
+                        {
+                            continue;
+                        }
+                        Procreation pComponent = potentialMate.GetComponent<Procreation>();
+                        Character cComponent = potentialMate.GetComponent<Character>();
+                        if (!cComponent.IsTamed() || pComponent.IsPregnant())
+                        {
+                            continue;
+                        }
+                        nrOfParterInstances++;
+                    }
+                }
+            }
+            if (nrOfInstances + nrOfInstances2< procreation.m_maxCreatures && nrOfParterInstances >= 2)
+            {
+                return true;
+            }
+            else
+            {
+            }            
+            return false;
         }
 
         [HarmonyPatch(typeof(MonsterAI), "UpdateConsumeItem")]
@@ -129,6 +214,7 @@ namespace AutoFeed
                     return;
                 }
 
+
                 var nearbyContainers = GetNearbyContainers(___m_character.gameObject.transform.position, containerRange.Value, __instance);
 
                 using (List<ItemDrop>.Enumerator enumerator = __instance.m_consumeItems.GetEnumerator())
@@ -139,6 +225,11 @@ namespace AutoFeed
                         {
                             if (Utils.DistanceXZ(c.transform.position, __instance.transform.position) < moveProximity.Value && Mathf.Abs(c.transform.position.y - __instance.transform.position.y) > moveProximity.Value)
                                 continue;
+                            
+                            if (requireBreedingConditions.Value && !canBreedNearContainer(___m_character, ___m_nview, c))
+                            {
+                                return;
+                            }
 
                             ItemDrop.ItemData item = c.GetInventory().GetItem(enumerator.Current.m_itemData.m_shared.m_name);
                             if (item != null)
@@ -227,7 +318,7 @@ namespace AutoFeed
 
 
                 traverseAI.Method("LookAt", new object[] { c.transform.position }).GetValue();
-                
+
                 if (!traverseAI.Method("IsLookingAt", new object[] { c.transform.position, 90f }).GetValue<bool>())
                     return;
 
